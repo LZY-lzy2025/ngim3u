@@ -3,7 +3,7 @@ name: Build and Push to GHCR
 on:
   push:
     branches:
-      - main # 如果你的主分支叫 master，请改成 master
+      - main # 如果你的主分支叫 master，请把这里改成 master
 
 env:
   REGISTRY: ghcr.io
@@ -34,7 +34,6 @@ jobs:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
           tags: |
             type=raw,value=latest
-            type=sha
 
       - name: Build and push Docker image
         uses: docker/build-push-action@v5
