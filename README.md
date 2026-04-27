@@ -33,6 +33,16 @@ http://localhost:8080/index.php?url=https%3A%2F%2Fexample.com%2Flive%2Findex.m3u
 3. 暴露容器 80 端口（平台通常自动处理）。
 4. 使用平台分配域名访问 `index.php?url=...`。
 
+
+### 方式 3：Vercel 部署
+
+1. 将仓库导入 Vercel。
+2. 保留仓库内 `vercel.json`（已配置 `@vercel/php` 运行时并将所有路由转发到 `index.php`）。
+3. 在 Vercel Project Settings -> Environment Variables 中配置本项目环境变量。
+4. 部署后通过：`https://你的域名/index.php?url=...` 访问。
+
+> 说明：Vercel 是 Serverless 模式，请注意单次执行时长与流媒体大文件转发限制，建议用于轻量场景。
+
 ## 环境变量
 
 - `TARGET_REFERER`：
