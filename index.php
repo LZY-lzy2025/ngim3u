@@ -1,79 +1,189 @@
 <?php
-// 获取需要代理的 URL
-$url = isset($_GET['url']) ? $_GET['url'] : '';
-if (!$url) die("Missing URL parameter");
+// 简单的 M3U8 代理：支持 Referer/UA 伪装、相对路径重写，并增加了基础安全与稳定性控制。
 
-// 从环境变量读取配置 (在 Zeabur 面板设置)
-$referer_env = getenv('TARGET_REFERER');
-$user_agent = getenv('TARGET_UA') ?: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36";
-
-// 初始化 cURL
-$ch = curl_init();
-curl_setopt($ch, CURLOPT_URL, $url);
-curl_setopt($ch, CURLOPT_RETURNTRANSFER, 1);
-curl_setopt($ch, CURLOPT_FOLLOWLOCATION, 1);
-curl_setopt($ch, CURLOPT_SSL_VERIFYPEER, false);
-curl_setopt($ch, CURLOPT_SSL_VERIFYHOST, false);
-curl_setopt($ch, CURLOPT_USERAGENT, $user_agent);
-
-// --- 处理 Referer ---
-if ($referer_env === 'none' || $referer_env === false || $referer_env === '') {
-    // 如果环境变量填了 'none' 或者完全没填，强制清空 Referer 请求头，实现 no-Referer
-    curl_setopt($ch, CURLOPT_HTTPHEADER, array('Referer:'));
-} else {
-    // 如果填了具体的网址，就伪装成该网址
-    curl_setopt($ch, CURLOPT_REFERER, $referer_env);
+function env_bool(string $key, bool $default = false): bool {
+    $v = getenv($key);
+    if ($v === false) {
+        return $default;
+    }
+    $v = strtolower(trim((string)$v));
+    return in_array($v, ['1', 'true', 'yes', 'on'], true);
 }
 
-// 执行请求
-$response = curl_exec($ch);
-$content_type = curl_getinfo($ch, CURLINFO_CONTENT_TYPE);
-curl_close($ch);
+function bad_request(string $message): void {
+    http_response_code(400);
+    header('Content-Type: text/plain; charset=utf-8');
+    echo $message;
+    exit;
+}
 
-// 获取基础路径，用于补全 ts 文件的相对路径
-$base_url = substr($url, 0, strrpos($url, '/') + 1);
+function upstream_error(string $message, int $status = 502): void {
+    http_response_code($status);
+    header('Content-Type: text/plain; charset=utf-8');
+    echo $message;
+    exit;
+}
 
-// 自动识别当前的访问协议 (适配 Zeabur 的 HTTPS)
-$protocol = (isset($_SERVER['HTTP_X_FORWARDED_PROTO']) && $_SERVER['HTTP_X_FORWARDED_PROTO'] === 'https') ? 'https://' : (isset($_SERVER['HTTPS']) && $_SERVER['HTTPS'] === 'on' ? 'https://' : 'http://');
-$self_url = $protocol . $_SERVER['HTTP_HOST'] . explode('?', $_SERVER['REQUEST_URI'])[0] . "?url=";
+function is_allowed_host(string $host, string $allowlist): bool {
+    $allowlist = trim($allowlist);
+    if ($allowlist === '') {
+        return true;
+    }
 
-// 判断如果是 M3U8 列表，则需要重写里面的链接
-if (strpos($url, '.m3u8') !== false || strpos($content_type, 'mpegurl') !== false) {
-    header("Content-Type: application/vnd.apple.mpegurl");
-    
-    $lines = explode("\n", $response);
-    $new_response = "";
-    
-    foreach ($lines as $line) {
-        $line = trim($line);
-        if (empty($line)) continue;
-        
-        // 保留 M3U8 的标签和注释
-        if (strpos($line, '#') === 0) {
-            $new_response .= $line . "\n";
-        } else {
-            // 处理视频流链接
-            if (strpos($line, 'http') === 0) {
-                // 已经是绝对路径
-                $ts_url = $line;
-            } else {
-                // 如果是相对路径，拼接成绝对路径
-                if (strpos($line, '/') === 0) {
-                    $parsed = parse_url($url);
-                    $ts_url = $parsed['scheme'] . "://" . $parsed['host'] . $line;
-                } else {
-                    $ts_url = $base_url . $line;
-                }
-            }
-            // 让所有的 ts 切片文件也通过代理脚本去请求
-            $new_response .= $self_url . urlencode($ts_url) . "\n";
+    $allowed = array_filter(array_map('trim', explode(',', $allowlist)));
+    foreach ($allowed as $item) {
+        if (strcasecmp($host, $item) === 0) {
+            return true;
         }
     }
-    echo $new_response;
-    
-} else {
-    // 如果是 .ts 视频切片或其他文件，直接输出原始的二进制流
-    header("Content-Type: " . ($content_type ? $content_type : "video/MP2T"));
-    echo $response;
+    return false;
 }
-?>
+
+function absolute_url(string $base, string $relative): string {
+    if (preg_match('#^https?://#i', $relative)) {
+        return $relative;
+    }
+
+    $parts = parse_url($base);
+    if (!$parts || !isset($parts['scheme'], $parts['host'])) {
+        return $relative;
+    }
+
+    $scheme = $parts['scheme'];
+    $host = $parts['host'];
+    $port = isset($parts['port']) ? ':' . $parts['port'] : '';
+
+    if (strpos($relative, '//') === 0) {
+        return $scheme . ':' . $relative;
+    }
+
+    $path = isset($parts['path']) ? $parts['path'] : '/';
+    $dir = preg_replace('#/[^/]*$#', '/', $path);
+
+    if (strpos($relative, '/') === 0) {
+        $fullPath = $relative;
+    } else {
+        $fullPath = $dir . $relative;
+    }
+
+    // 规范化 ./ 和 ../
+    $segments = [];
+    foreach (explode('/', $fullPath) as $segment) {
+        if ($segment === '' || $segment === '.') {
+            continue;
+        }
+        if ($segment === '..') {
+            array_pop($segments);
+            continue;
+        }
+        $segments[] = $segment;
+    }
+
+    return $scheme . '://' . $host . $port . '/' . implode('/', $segments);
+}
+
+$url = isset($_GET['url']) ? trim((string)$_GET['url']) : '';
+if ($url === '') {
+    bad_request('Missing URL parameter');
+}
+
+$parsedUrl = parse_url($url);
+if (!$parsedUrl || !isset($parsedUrl['scheme'], $parsedUrl['host'])) {
+    bad_request('Invalid URL');
+}
+
+$scheme = strtolower((string)$parsedUrl['scheme']);
+if (!in_array($scheme, ['http', 'https'], true)) {
+    bad_request('Only http/https URLs are supported');
+}
+
+$enableHostAllowlist = env_bool('ENABLE_HOST_ALLOWLIST', false);
+$allowlist = getenv('TARGET_HOST_ALLOWLIST') ?: '';
+if ($enableHostAllowlist) {
+    if (trim($allowlist) === '') {
+        bad_request('ENABLE_HOST_ALLOWLIST is on, but TARGET_HOST_ALLOWLIST is empty');
+    }
+
+    if (!is_allowed_host((string)$parsedUrl['host'], $allowlist)) {
+        bad_request('Target host is not in allowlist');
+    }
+}
+
+$refererEnv = getenv('TARGET_REFERER');
+$userAgent = getenv('TARGET_UA') ?: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36';
+$insecureSsl = env_bool('INSECURE_SSL', false);
+$connectTimeout = (int)(getenv('CONNECT_TIMEOUT') ?: 5);
+$requestTimeout = (int)(getenv('REQUEST_TIMEOUT') ?: 20);
+
+$ch = curl_init();
+curl_setopt($ch, CURLOPT_URL, $url);
+curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
+curl_setopt($ch, CURLOPT_FOLLOWLOCATION, true);
+curl_setopt($ch, CURLOPT_USERAGENT, $userAgent);
+curl_setopt($ch, CURLOPT_CONNECTTIMEOUT, max(1, $connectTimeout));
+curl_setopt($ch, CURLOPT_TIMEOUT, max(1, $requestTimeout));
+curl_setopt($ch, CURLOPT_HTTP_VERSION, CURL_HTTP_VERSION_1_1);
+
+if ($insecureSsl) {
+    curl_setopt($ch, CURLOPT_SSL_VERIFYPEER, false);
+    curl_setopt($ch, CURLOPT_SSL_VERIFYHOST, false);
+}
+
+if ($refererEnv === 'none' || $refererEnv === false || $refererEnv === '') {
+    curl_setopt($ch, CURLOPT_HTTPHEADER, ['Referer:']);
+} else {
+    curl_setopt($ch, CURLOPT_REFERER, $refererEnv);
+}
+
+$response = curl_exec($ch);
+if ($response === false) {
+    $err = curl_error($ch);
+    curl_close($ch);
+    upstream_error('Upstream request failed: ' . $err);
+}
+
+$contentType = curl_getinfo($ch, CURLINFO_CONTENT_TYPE) ?: '';
+$httpCode = (int)curl_getinfo($ch, CURLINFO_RESPONSE_CODE);
+curl_close($ch);
+
+if ($httpCode >= 400) {
+    upstream_error('Upstream responded with HTTP ' . $httpCode, 502);
+}
+
+$protocol = (
+    isset($_SERVER['HTTP_X_FORWARDED_PROTO']) && $_SERVER['HTTP_X_FORWARDED_PROTO'] === 'https'
+) ? 'https://' : ((isset($_SERVER['HTTPS']) && $_SERVER['HTTPS'] === 'on') ? 'https://' : 'http://');
+
+$selfUrl = $protocol . $_SERVER['HTTP_HOST'] . explode('?', $_SERVER['REQUEST_URI'])[0] . '?url=';
+
+$isM3u8 = (stripos($url, '.m3u8') !== false) || (stripos($contentType, 'mpegurl') !== false);
+if ($isM3u8) {
+    header('Content-Type: application/vnd.apple.mpegurl');
+    header('Cache-Control: no-store, no-cache, must-revalidate, max-age=0');
+
+    $lines = preg_split('/\r\n|\r|\n/', $response);
+    $newResponse = '';
+
+    foreach ($lines as $line) {
+        $line = trim($line);
+        if ($line === '') {
+            $newResponse .= "\n";
+            continue;
+        }
+
+        if (strpos($line, '#') === 0) {
+            $newResponse .= $line . "\n";
+            continue;
+        }
+
+        $segmentUrl = absolute_url($url, $line);
+        $newResponse .= $selfUrl . rawurlencode($segmentUrl) . "\n";
+    }
+
+    echo $newResponse;
+    exit;
+}
+
+header('Content-Type: ' . ($contentType !== '' ? $contentType : 'application/octet-stream'));
+header('Cache-Control: public, max-age=30');
+echo $response;
